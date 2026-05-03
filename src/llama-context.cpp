@@ -2090,13 +2090,9 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
         return std::max<uint32_t>(n_tokens * 40, 32u * model.n_tensors());
     }
     if (model.arch == LLM_ARCH_DEEPSEEK4) {
-        // DeepSeek V4 has a position-dependent compressed-attention decode path
-        // that creates many temporary tensor objects, especially when a long
-        // prompt is split into non-prefill ubatches. The visible graph node
-        // count is much smaller than the number of GGML objects allocated while
-        // building those graphs, so reserve a larger metadata arena than the
-        // generic tensor-count heuristic would provide.
-        return std::max<uint32_t>(524288u, n_tokens * 192 + 64u * model.n_tensors());
+        // DeepSeek V4 fused Gated Delta Net creates ~780 temporary nodes per token
+        // (measured: 808K at 1024, 1.6M at 2048, 1328 tensors)
+        return n_tokens * 780 + 64u * model.n_tensors();
     }
     uint32_t res = std::max<uint32_t>(1024u, 8u*model.n_tensors());
     for (const auto & lora : model.loras) {
@@ -2159,6 +2155,12 @@ ggml_cgraph * llama_context::graph_reserve(
     res->reset();
 
     auto * gf = model.build_graph(gparams);
+
+    if (model.arch == LLM_ARCH_DEEPSEEK4) {
+        LLAMA_LOG_INFO("graph_max_nodes: [DeepSeek4] n_tokens=%u n_tensors=%zu actual_nodes=%d reserved=%ld (used=%.1f%%)\n",
+            n_tokens, (size_t)model.n_tensors(), ggml_graph_n_nodes(gf), res->get_max_nodes(),
+            (ggml_graph_n_nodes(gf) * 100.0f) / res->get_max_nodes());
+    }
 
     this->n_outputs = save_n_outputs;
 
