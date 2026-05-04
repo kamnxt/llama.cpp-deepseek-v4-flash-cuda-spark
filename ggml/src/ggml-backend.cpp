@@ -1050,24 +1050,26 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         // do not overwrite user assignments
         if (*node_backend_id == -1) {
             *node_backend_id = ggml_backend_sched_backend_id_from_cur(sched, node);
-
-#if 0
-            // src
-            if (node->op == GGML_OP_NONE) {
-                continue;
-            }
-
-            for (int j = 0; j < GGML_MAX_SRC; j++) {
-                struct ggml_tensor * src = node->src[j];
-                if (src == NULL) {
-                    continue;
-                }
-                int * src_backend_id = &tensor_backend_id(src);
-                if (*src_backend_id == -1) {
-                    *src_backend_id = ggml_backend_sched_backend_id_from_cur(sched, src);
+            // Debug: track Flash Attention assignment in pass 1
+            if (node->op == GGML_OP_FLASH_ATTN_EXT) {
+                GGML_LOG_INFO("pass1: node[%d] %s assigned to backend %d\n",
+                    i, node->name, *node_backend_id);
+                for (int j = 0; j < GGML_MAX_SRC; j++) {
+                    if (node->src[j]) {
+                        GGML_LOG_INFO("  src[%d]: %s backend_id=%d buffer=%p input=%d\n",
+                            j, node->src[j]->name, tensor_backend_id(node->src[j]), node->src[j]->buffer,
+                            node->src[j]->flags & GGML_TENSOR_FLAG_INPUT ? 1 : 0);
+                    }
                 }
             }
-#endif
+        }
+    }
+
+    // Debug: log all INPUT-flagged leafs
+    for (int i = 0; i < graph->n_leafs; i++) {
+        struct ggml_tensor * leaf = graph->leafs[i];
+        if (leaf->flags & GGML_TENSOR_FLAG_INPUT) {
+            GGML_LOG_INFO("pass1-leaf-input: %s backend=%d\n", leaf->name, tensor_backend_id(leaf));
         }
     }
 
@@ -1128,7 +1130,12 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             }
             int * node_backend_id = &tensor_backend_id(node);
             if (*node_backend_id != -1) {
-                cur_backend_id = *node_backend_id;
+                if (*node_backend_id == sched->n_backends - 1) {
+                    // skip cpu (lowest prio backend) - don't let it propagate
+                    cur_backend_id = -1;
+                } else {
+                    cur_backend_id = *node_backend_id;
+                }
             } else if (cur_backend_id != -1) {
                 ggml_backend_sched_set_if_supported(sched, node, cur_backend_id, node_backend_id);
             }
@@ -1144,7 +1151,12 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             }
             int * node_backend_id = &tensor_backend_id(node);
             if (*node_backend_id != -1) {
-                cur_backend_id = *node_backend_id;
+                if (*node_backend_id == sched->n_backends - 1) {
+                    // skip cpu (lowest prio backend) - don't let it propagate
+                    cur_backend_id = -1;
+                } else {
+                    cur_backend_id = *node_backend_id;
+                }
             } else if (cur_backend_id != -1) {
                 ggml_backend_sched_set_if_supported(sched, node, cur_backend_id, node_backend_id);
             }
@@ -1176,6 +1188,10 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                         if (src == NULL) {
                             continue;
                         }
+                        // skip input tensors - they'll be copied to the target backend anyway
+                        if (src->flags & GGML_TENSOR_FLAG_INPUT) {
+                            continue;
+                        }
                         if ((tensor_backend_id(src) != -1 || tensor_backend_id(src->view_src) != -1) && ggml_backend_sched_buffer_supported(sched, src, b)) {
                             n_supported++;
                         }
@@ -1195,6 +1211,10 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                     for (int j = 0; j < GGML_MAX_SRC; j++) {
                         struct ggml_tensor * src = node->src[j];
                         if (src == NULL) {
+                            continue;
+                        }
+                        // skip input tensors - they'll be copied to the target backend anyway
+                        if (src->flags & GGML_TENSOR_FLAG_INPUT) {
                             continue;
                         }
                         if (!ggml_backend_sched_buffer_supported(sched, src, b)) {
@@ -1534,6 +1554,38 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
         if (!ggml_gallocr_alloc_graph(sched->galloc, &sched->graph)) {
             GGML_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             return false;
+        }
+    }
+
+    // Log backend assignment for debugging
+    {
+        int n_cpu = 0, n_gpu = 0, cpu_backend_id = sched->n_backends - 1;
+        int cpu_splits = 0, gpu_splits = 0, cpu_inputs = 0, gpu_inputs = 0;
+        for (int i = 0; i < sched->graph.n_nodes; i++) {
+            if (tensor_backend_id(sched->graph.nodes[i]) == cpu_backend_id) n_cpu++;
+            else n_gpu++;
+        }
+        for (int i = 0; i < sched->n_splits; i++) {
+            if (sched->splits[i].backend_id == cpu_backend_id) {
+                cpu_splits++;
+                cpu_inputs += sched->splits[i].n_inputs;
+            } else {
+                gpu_splits++;
+                gpu_inputs += sched->splits[i].n_inputs;
+            }
+        }
+        GGML_LOG_INFO("sched_splits: nodes: cpu=%d gpu=%d (cpu=%.1f%%) | splits: gpu=%d gpu_in=%d | cpu=%d cpu_in=%d\n",
+            n_cpu, n_gpu, (n_cpu * 100.0f) / (n_cpu + n_gpu),
+            gpu_splits, gpu_inputs, cpu_splits, cpu_inputs);
+        if (n_cpu > 0) {
+            int printed = 0;
+            for (int i = 0; i < sched->graph.n_nodes && printed < 10; i++) {
+                struct ggml_tensor * node = sched->graph.nodes[i];
+                if (tensor_backend_id(node) == cpu_backend_id) {
+                    GGML_LOG_INFO("  cpu_node[%d]: %s (%s) cause=%s\n", i, node->name, ggml_op_name(node->op), GET_CAUSE(node));
+                    printed++;
+                }
+            }
         }
     }
 
