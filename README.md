@@ -1,3 +1,15 @@
+# DeepSeek v4 Flash experimental GB10/DGX Spark support
+This repo is a fork of [Fringe210/llama.cpp-deepseek-v4-flash-cuda](https://github.com/Fringe210/llama.cpp-deepseek-v4-flash-cuda), except I wanted to see if I could get it running on a single GB10/Spark.
+
+Of course, this being code used for running LLMs, I used an LLM to figure out why it didn't work and fix it.
+
+It got it running, but at ~3-4t/s, and with high CPU usage... so obviously the next step was to tell it to fix that :D
+
+All "my" commits in this repo (except for this README update) are AI generated for what it's worth.
+
+Fits nicely with the [IQ2XXS quant](https://huggingface.co/antirez/deepseek-v4-gguf/blob/main/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2.gguf), at 4096 batch size!
+
+
 # DeepSeek v4 Flash experimental CUDA support
 
 This repository is a fork of [antirez/llama.cpp-deepseek-v4-flash](https://github.com/antirez/llama.cpp-deepseek-v4-flash) that enables CUDA support for DeepSeek V4 Flash.
@@ -18,7 +30,7 @@ Current status:
 
 Original project: [antirez/llama.cpp-deepseek-v4-flash](https://github.com/antirez/llama.cpp-deepseek-v4-flash)
 
-Then to test it compile with cuda enable (tested on windows cuda 13.1) 
+Then to test it compile with cuda enable (tested on windows cuda 13.1)
 
 ```
 llama-server.exe --model "C:\Users\EA\Downloads\DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat.gguf" --host 127.0.0.1 --port 8080 -c 8192 --n-gpu-layers 999 --parallel 1 --no-warmup --flash-attn on
