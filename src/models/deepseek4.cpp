@@ -1103,8 +1103,8 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
                             "dsv4_attn_raw_window_mask");
                     ggml_tensor * index_mask = get_dsv4_inputs()->add_mask(ctx0,
                             dsv4_mask_kind::COMPRESS_CAUSAL,
-                            n_comp_padded_pf, n_tokens,
-                            0, n_comp_padded_pf, 0, compress_ratio,
+                            n_comp, n_tokens,
+                            0, n_comp, 0, compress_ratio,
                             "dsv4_indexer_causal_mask");
 
                     ggml_tensor * index_kv = dsv4_build_compressor_prefill(ctx0, cur,
@@ -1139,6 +1139,11 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
                     ggml_tensor * comp_mask = dsv4_build_compressed_mask_from_topk(ctx0, index_scores, topk);
                     cb(comp_mask, "dsv4_attn_compress_mask", il);
 
+                    // Pad comp_mask to n_comp_padded_pf to match padded k_all
+                    if (n_comp_padded_pf > n_comp) {
+                        ggml_tensor * pad_mask = dsv4_new_filled_2d(ctx0, n_comp_padded_pf - n_comp, n_tokens, -INFINITY);
+                        comp_mask = ggml_concat(ctx0, comp_mask, pad_mask, 0);
+                    }
                     attn_mask = ggml_concat(ctx0, raw_mask, comp_mask, 0);
                 } else {
                     attn_mask = get_dsv4_inputs()->add_mask(ctx0,
@@ -1263,11 +1268,16 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
                         }
 
                         if (n_tokens == 1 && n_comp_visible <= hparams.indexer_top_k) {
+                            // Use n_comp_visible for valid mask entries, then pad to n_comp_padded to match k_all
                             comp_mask = get_dsv4_inputs()->add_mask(ctx0,
                                     dsv4_mask_kind::COMPRESS_CAUSAL,
-                                    n_comp_padded, n_tokens,
-                                    0, n_comp_padded, 0, compress_ratio,
+                                    n_comp_visible, n_tokens,
+                                    0, n_comp_visible, 0, compress_ratio,
                                     "dsv4_attn_compress_mask");
+                            if (n_comp_padded > n_comp_visible) {
+                                ggml_tensor * pad_mask = dsv4_new_filled_2d(ctx0, n_comp_padded - n_comp_visible, n_tokens, -INFINITY);
+                                comp_mask = ggml_concat(ctx0, comp_mask, pad_mask, 0);
+                            }
                         } else {
                             ggml_tensor * index_cache = dsv4_cache_view_3d(ctx0, mctx_dsv4->get_dsv4_index_k(ctx0, il, seq_id), n_comp_padded);
                             index_cache = ggml_reshape_2d(ctx0, index_cache, hparams.indexer_head_size, n_comp_padded);
@@ -1308,11 +1318,16 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
                             comp_mask = dsv4_build_compressed_mask_from_topk(ctx0, index_scores, topk);
                         }
                     } else {
+                        // Use n_comp_visible for valid mask entries, then pad to n_comp_padded
                         comp_mask = get_dsv4_inputs()->add_mask(ctx0,
                                 dsv4_mask_kind::COMPRESS_CAUSAL,
-                                n_comp_padded, n_tokens,
-                                0, n_comp_padded, 0, compress_ratio,
+                                n_comp_visible, n_tokens,
+                                0, n_comp_visible, 0, compress_ratio,
                                 "dsv4_attn_compress_mask");
+                        if (n_comp_padded > n_comp_visible) {
+                            ggml_tensor * pad_mask = dsv4_new_filled_2d(ctx0, n_comp_padded - n_comp_visible, n_tokens, -INFINITY);
+                            comp_mask = ggml_concat(ctx0, comp_mask, pad_mask, 0);
+                        }
                     }
 
                     attn_mask = ggml_concat(ctx0, attn_mask, comp_mask, 0);
