@@ -3120,8 +3120,12 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     };
 
     // assign the input layer
-    // there is very little benefit to offloading the input layer, so always keep it on the CPU
-    pimpl->dev_input = { cpu_dev, &pimpl->cpu_buft_list };
+    // try to offload to GPU if possible, fallback to CPU
+    if (llama_supports_gpu_offload() && !devices.empty()) {
+        pimpl->dev_input = { devices[0].dev, &pimpl->gpu_buft_list.at(devices[0].dev) };
+    } else {
+        pimpl->dev_input = { cpu_dev, &pimpl->cpu_buft_list };
+    }
 
     // assign the repeating layers to the devices according to the splits
     pimpl->dev_layer.resize(n_layer);
