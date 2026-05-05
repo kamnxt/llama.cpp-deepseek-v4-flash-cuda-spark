@@ -1050,26 +1050,6 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         // do not overwrite user assignments
         if (*node_backend_id == -1) {
             *node_backend_id = ggml_backend_sched_backend_id_from_cur(sched, node);
-            // Debug: track Flash Attention assignment in pass 1
-            if (node->op == GGML_OP_FLASH_ATTN_EXT) {
-                GGML_LOG_INFO("pass1: node[%d] %s assigned to backend %d\n",
-                    i, node->name, *node_backend_id);
-                for (int j = 0; j < GGML_MAX_SRC; j++) {
-                    if (node->src[j]) {
-                        GGML_LOG_INFO("  src[%d]: %s backend_id=%d buffer=%p input=%d\n",
-                            j, node->src[j]->name, tensor_backend_id(node->src[j]), node->src[j]->buffer,
-                            node->src[j]->flags & GGML_TENSOR_FLAG_INPUT ? 1 : 0);
-                    }
-                }
-            }
-        }
-    }
-
-    // Debug: log all INPUT-flagged leafs
-    for (int i = 0; i < graph->n_leafs; i++) {
-        struct ggml_tensor * leaf = graph->leafs[i];
-        if (leaf->flags & GGML_TENSOR_FLAG_INPUT) {
-            GGML_LOG_INFO("pass1-leaf-input: %s backend=%d\n", leaf->name, tensor_backend_id(leaf));
         }
     }
 
@@ -1097,6 +1077,11 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             } else if (cur_backend_id != -1) {
                 ggml_backend_sched_set_if_supported(sched, node, cur_backend_id, node_backend_id);
             }
+            // Debug: log FLASH_ATTN_EXT after expand-gpu-down
+            if (node->op == GGML_OP_FLASH_ATTN_EXT && *node_backend_id != -1) {
+                fprintf(stderr, "[sched] p2-down: node[%d] %s backend=%d\n",
+                    i, node->name, *node_backend_id);
+            }
         }
     }
     // expand gpu up
@@ -1117,6 +1102,11 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 }
             } else if (cur_backend_id != -1) {
                 ggml_backend_sched_set_if_supported(sched, node, cur_backend_id, node_backend_id);
+            }
+            // Debug: log FLASH_ATTN_EXT after expand-gpu-up
+            if (node->op == GGML_OP_FLASH_ATTN_EXT && *node_backend_id != -1) {
+                fprintf(stderr, "[sched] p2-up:   node[%d] %s backend=%d\n",
+                    i, node->name, *node_backend_id);
             }
         }
     }
@@ -1162,6 +1152,14 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             }
         }
     }
+    // Debug: log FLASH_ATTN_EXT state before pass 3
+    for (int i = 0; i < graph->n_nodes; i++) {
+        struct ggml_tensor * node = graph->nodes[i];
+        if (node->op == GGML_OP_FLASH_ATTN_EXT) {
+            fprintf(stderr, "[sched] before-p3: node[%d] %s backend=%d\n",
+                i, node->name, tensor_backend_id(node));
+        }
+    }
 
     // pass 3: upgrade nodes to higher prio backends with compatible buffer types
     // if the tensor is already in the same buffer type (*) as another higher priority backend, we should move it there
@@ -1181,7 +1179,12 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             // unassigned node: find the backend with the most supported inputs
             int n_supported_best = -1;
             for (int b = 0; b < sched->n_backends; b++) {
-                if (ggml_backend_supports_op(sched->backends[b], node)) {
+                bool sup = ggml_backend_supports_op(sched->backends[b], node);
+                if (node->op == GGML_OP_FLASH_ATTN_EXT) {
+                    fprintf(stderr, "[sched] p3-node[%d] %s backend%d supports=%d\n",
+                        i, node->name, b, sup);
+                }
+                if (sup) {
                     int n_supported = 0;
                     for (int j = 0; j < GGML_MAX_SRC; j++) {
                         struct ggml_tensor * src = node->src[j];
@@ -1202,6 +1205,10 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                         SET_CAUSE(node, "3.best");
                     }
                 }
+            }
+            if (node->op == GGML_OP_FLASH_ATTN_EXT && *node_backend_id == -1) {
+                GGML_LOG_INFO("pass3: node[%d] %s NO backend supports it after unassigned loop\n",
+                    i, node->name);
             }
         } else {
             // assigned node: upgrade to higher prio backend if possible
@@ -1232,6 +1239,15 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         }
     }
 
+    // Debug: log FLASH_ATTN_EXT state after pass 3
+    for (int i = 0; i < graph->n_nodes; i++) {
+        struct ggml_tensor * node = graph->nodes[i];
+        if (node->op == GGML_OP_FLASH_ATTN_EXT) {
+            fprintf(stderr, "[sched] after-p3:  node[%d] %s backend=%d\n",
+                i, node->name, tensor_backend_id(node));
+        }
+    }
+
     // pass 4: assign backends to remaining src from dst and view_src
     for (int i = 0; i < graph->n_nodes; i++) {
         struct ggml_tensor * node = graph->nodes[i];
@@ -1258,10 +1274,31 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             }
         }
         // if the node is still unassigned, assign it to the first backend that supports it
+        if (*cur_backend_id == -1 && node->op == GGML_OP_FLASH_ATTN_EXT) {
+            GGML_LOG_INFO("pass4-unassigned: node[%d] %s before fallback\n",
+                i, node->name);
+        }
         for (int b = 0; b < sched->n_backends && *cur_backend_id == -1; b++) {
+            if (node->op == GGML_OP_FLASH_ATTN_EXT) {
+                GGML_LOG_INFO("pass4-fallback: node[%d] %s trying backend %d\n",
+                    i, node->name, b);
+            }
             ggml_backend_sched_set_if_supported(sched, node, b, cur_backend_id);
         }
+        if (*cur_backend_id == -1) {
+            GGML_LOG_ERROR("pass4-failed: node[%d] %s (%s) no backend supports it!\n",
+                i, node->name, ggml_op_name(node->op));
+        }
         GGML_ASSERT(*cur_backend_id != -1);
+    }
+
+    // Debug: log FLASH_ATTN_EXT state after pass 4
+    for (int i = 0; i < graph->n_nodes; i++) {
+        struct ggml_tensor * node = graph->nodes[i];
+        if (node->op == GGML_OP_FLASH_ATTN_EXT) {
+            fprintf(stderr, "[sched] after-p4:  node[%d] %s backend=%d\n",
+                i, node->name, tensor_backend_id(node));
+        }
     }
 
     // pass 5: split graph, find tensors that need to be copied
@@ -1581,7 +1618,7 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
             int printed = 0;
             for (int i = 0; i < sched->graph.n_nodes && printed < 10; i++) {
                 struct ggml_tensor * node = sched->graph.nodes[i];
-                if (tensor_backend_id(node) == cpu_backend_id) {
+                if (tensor_backend_id(node) == cpu_backend_id && node->op == GGML_OP_FLASH_ATTN_EXT) {
                     GGML_LOG_INFO("  cpu_node[%d]: %s (%s) cause=%s\n", i, node->name, ggml_op_name(node->op), GET_CAUSE(node));
                     printed++;
                 }

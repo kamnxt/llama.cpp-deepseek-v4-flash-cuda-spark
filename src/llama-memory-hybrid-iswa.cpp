@@ -203,7 +203,10 @@ llama_memory_hybrid_iswa::llama_memory_hybrid_iswa(
             continue;
         }
 
-        const uint32_t n_comp = std::max<uint32_t>(1, (kv_size + ratio - 1) / ratio);
+        // Pad n_comp to 256 alignment for CUDA flash attention with head_dim >= 512
+        // (DSV4 layers have head_dim=512 which requires K->ne[1] % 256 == 0)
+        const uint32_t n_comp_pad = 256;
+        const uint32_t n_comp = std::max<uint32_t>(n_comp_pad, GGML_PAD((kv_size + ratio - 1) / ratio, n_comp_pad));
 
         const char * dev_name = "CPU";
         ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
@@ -214,7 +217,7 @@ llama_memory_hybrid_iswa::llama_memory_hybrid_iswa(
             dev_name = ggml_backend_dev_name(dev);
         }
 
-        LLAMA_LOG_DEBUG("%s: DeepSeek4 compressed KV layer %3d: dev = %s, ratio = %u, rows = %u\n",
+        LLAMA_LOG_DEBUG("%s: DeepSeek4 compressed KV layer %3d: dev = %s, ratio = %u, rows = %u (padded)\n",
                 __func__, il, dev_name, ratio, n_comp);
 
         ggml_context * ctx = ctx_for_buft(buft);

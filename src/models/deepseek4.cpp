@@ -904,7 +904,15 @@ static ggml_tensor * dsv4_build_compressed_mask_from_topk(
     return ggml_reshape_2d(ctx, mask, n_comp, n_tokens);
 }
 
-static ggml_tensor * dsv4_cache_view_3d(ggml_context * ctx, ggml_tensor * cache, int64_t n_rows) {
+static ggml_tensor * dsv4_cache_view_3d(ggml_context * ctx, ggml_tensor * cache, int64_t n_rows, int64_t pad_to = 0, int64_t extra = 0) {
+    // Pad n_rows to pad_to alignment for CUDA flash attention compatibility
+    // (head_dim >= 512 requires K->ne[1] % 256 == 0 after concat with raw tokens)
+    // 'extra' accounts for additional tokens that will be concatenated (e.g. raw KV tokens)
+    if (pad_to > 0) {
+        int64_t total = n_rows + extra;
+        int64_t total_padded = GGML_PAD(total, pad_to);
+        n_rows = total_padded - extra;
+    }
     ggml_tensor * view = ggml_view_2d(ctx, cache, cache->ne[0], n_rows, cache->nb[1], 0);
     return ggml_reshape_3d(ctx, view, cache->ne[0], 1, n_rows);
 }
@@ -1081,6 +1089,9 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
 
                 store_attn_cache_rows(kv_comp, 0, n_comp);
 
+                // Pad total (n_tokens + n_comp) to 256 for CUDA flash attention
+                const int64_t n_comp_padded_pf = GGML_PAD(n_tokens + n_comp, 256) - n_tokens;
+                kv_comp = ggml_pad(ctx0, kv_comp, 0, 0, n_comp_padded_pf - n_comp, 0);
                 k_all = ggml_concat(ctx0, kv, kv_comp, 2);
                 v_all = k_all;
 
@@ -1088,12 +1099,12 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
                     ggml_tensor * raw_mask = get_dsv4_inputs()->add_mask(ctx0,
                             dsv4_mask_kind::RAW_WINDOW,
                             n_tokens, n_tokens,
-                            n_tokens, n_comp, hparams.n_swa, compress_ratio,
+                            n_tokens, n_comp_padded_pf, hparams.n_swa, compress_ratio,
                             "dsv4_attn_raw_window_mask");
                     ggml_tensor * index_mask = get_dsv4_inputs()->add_mask(ctx0,
                             dsv4_mask_kind::COMPRESS_CAUSAL,
-                            n_comp, n_tokens,
-                            0, n_comp, 0, compress_ratio,
+                            n_comp_padded_pf, n_tokens,
+                            0, n_comp_padded_pf, 0, compress_ratio,
                             "dsv4_indexer_causal_mask");
 
                     ggml_tensor * index_kv = dsv4_build_compressor_prefill(ctx0, cur,
@@ -1132,8 +1143,8 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
                 } else {
                     attn_mask = get_dsv4_inputs()->add_mask(ctx0,
                             dsv4_mask_kind::ATTN_STATIC,
-                            n_tokens + n_comp, n_tokens,
-                            n_tokens, n_comp, hparams.n_swa, compress_ratio,
+                            n_tokens + n_comp_padded_pf, n_tokens,
+                            n_tokens, n_comp_padded_pf, hparams.n_swa, compress_ratio,
                             "dsv4_attn_static_mask");
                 }
             } else {
@@ -1198,7 +1209,10 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
                 attn_mask = inp_attn->self_kq_mask_swa;
 
                 if (n_comp_visible > 0) {
-                    ggml_tensor * kv_comp_cache = dsv4_cache_view_3d(ctx0, mctx_dsv4->get_dsv4_attn_k(ctx0, il, seq_id), n_comp_visible);
+                    // Pad total (n_swa + n_comp) to 256 for CUDA flash attention (head_dim=512 requires K->ne[1] % 256 == 0)
+                    const int64_t n_swa = k_raw->ne[2];
+                    const int64_t n_comp_padded = GGML_PAD(n_swa + n_comp_visible, 256) - n_swa;
+                    ggml_tensor * kv_comp_cache = dsv4_cache_view_3d(ctx0, mctx_dsv4->get_dsv4_attn_k(ctx0, il, seq_id), n_comp_padded);
                     k_all = ggml_concat(ctx0, k_raw, kv_comp_cache, 2);
                     v_all = k_all;
 
@@ -1251,12 +1265,12 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
                         if (n_tokens == 1 && n_comp_visible <= hparams.indexer_top_k) {
                             comp_mask = get_dsv4_inputs()->add_mask(ctx0,
                                     dsv4_mask_kind::COMPRESS_CAUSAL,
-                                    n_comp_visible, n_tokens,
-                                    0, n_comp_visible, 0, compress_ratio,
+                                    n_comp_padded, n_tokens,
+                                    0, n_comp_padded, 0, compress_ratio,
                                     "dsv4_attn_compress_mask");
                         } else {
-                            ggml_tensor * index_cache = dsv4_cache_view_3d(ctx0, mctx_dsv4->get_dsv4_index_k(ctx0, il, seq_id), n_comp_visible);
-                            index_cache = ggml_reshape_2d(ctx0, index_cache, hparams.indexer_head_size, n_comp_visible);
+                            ggml_tensor * index_cache = dsv4_cache_view_3d(ctx0, mctx_dsv4->get_dsv4_index_k(ctx0, il, seq_id), n_comp_padded);
+                            index_cache = ggml_reshape_2d(ctx0, index_cache, hparams.indexer_head_size, n_comp_padded);
                             ggml_tensor * index_scores = n_tokens == 1
                                 ? dsv4_build_indexer_scores_decode(ctx0,
                                         cur, qr, index_cache,
@@ -1265,19 +1279,19 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
                                         inp_pos,
                                         hparams.indexer_n_head,
                                         hparams.indexer_head_size,
-                                        n_comp_visible,
+                                        n_comp_padded,
                                         n_rot,
                                         rope_type,
                                         rope_cfg)
                                 : dsv4_build_indexer_scores_prefill(ctx0,
-                                        cur, qr, dsv4_cache_view_3d(ctx0, mctx_dsv4->get_dsv4_index_k(ctx0, il, seq_id), n_comp_visible),
+                                        cur, qr, dsv4_cache_view_3d(ctx0, mctx_dsv4->get_dsv4_index_k(ctx0, il, seq_id), n_comp_padded),
                                         layer.indexer_attn_q_b,
                                         layer.indexer_proj,
                                         inp_pos,
                                         get_dsv4_inputs()->add_mask(ctx0,
                                                 dsv4_mask_kind::COMPRESS_CAUSAL,
-                                                n_comp_visible, n_tokens,
-                                                0, n_comp_visible, 0, compress_ratio,
+                                                n_comp_padded, n_tokens,
+                                                0, n_comp_padded, 0, compress_ratio,
                                                 "dsv4_indexer_decode_causal_mask"),
                                         hparams.indexer_n_head,
                                         hparams.indexer_head_size,
@@ -1296,12 +1310,22 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
                     } else {
                         comp_mask = get_dsv4_inputs()->add_mask(ctx0,
                                 dsv4_mask_kind::COMPRESS_CAUSAL,
-                                n_comp_visible, n_tokens,
-                                0, n_comp_visible, 0, compress_ratio,
+                                n_comp_padded, n_tokens,
+                                0, n_comp_padded, 0, compress_ratio,
                                 "dsv4_attn_compress_mask");
                     }
 
                     attn_mask = ggml_concat(ctx0, attn_mask, comp_mask, 0);
+                } else {
+                    // n_comp_visible == 0: pad SWA-only path to 256 for CUDA flash attention
+                    const int64_t n_swa = k_raw->ne[2];
+                    const int64_t n_swa_padded = GGML_PAD(n_swa, 256);
+                    if (n_swa_padded > n_swa) {
+                        const int64_t n_pad = n_swa_padded - n_swa;
+                        k_all = ggml_pad(ctx0, k_raw, 0, 0, n_pad, 0);
+                        v_all = k_all;
+                        attn_mask = ggml_concat(ctx0, attn_mask, dsv4_new_filled_2d(ctx0, n_pad, n_tokens, -INFINITY), 0);
+                    }
                 }
             }
 

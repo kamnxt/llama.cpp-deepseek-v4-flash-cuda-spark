@@ -4818,6 +4818,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
     if (op->op != GGML_OP_MUL_MAT) {
         for (int i = 0; i < GGML_MAX_SRC; i++) {
             if (op->src[i] && op->src[i]->buffer && ggml_backend_buft_is_cuda_split(op->src[i]->buffer->buft)) {
+                if (op->op == GGML_OP_FLASH_ATTN_EXT) {
+                    fprintf(stderr, "[cuda] REJECT %s: split buffer on src[%d]\n", op->name, i);
+                }
                 return false;
             }
         }
@@ -4828,9 +4831,34 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         if (op->src[i] && op->src[i]->buffer && ggml_backend_buft_is_cuda(op->src[i]->buffer->buft)) {
             ggml_backend_cuda_buffer_type_context * buft_ctx = (ggml_backend_cuda_buffer_type_context *)op->src[i]->buffer->buft->context;
             if (buft_ctx->device != dev_ctx->device) {
+                if (op->op == GGML_OP_FLASH_ATTN_EXT) {
+                    fprintf(stderr, "[cuda] REJECT %s: src[%d] device=%d != dev=%d\n", op->name, i, buft_ctx->device, dev_ctx->device);
+                }
                 return false;
             }
         }
+    }
+
+    if (op->op == GGML_OP_FLASH_ATTN_EXT) {
+        bool result = ggml_cuda_flash_attn_ext_supported(dev_ctx->device, op);
+        if (!result) {
+            const ggml_tensor * Q = op->src[0];
+            const ggml_tensor * K = op->src[1];
+            const ggml_tensor * V = op->src[2];
+            const ggml_tensor * mask = op->src[3];
+            float max_bias = 0.0f;
+            memcpy(&max_bias, (const float *) op->op_params + 1, sizeof(float));
+            int gqa_ratio = Q->ne[2] / K->ne[2];
+            fprintf(stderr, "[cuda] REJECT %s: flash_attn unsupported Q[%ld,%ld,%ld,%ld] K[%ld,%ld,%ld,%ld] V[%ld,%ld,%ld,%ld] mask=%p max_bias=%f gqa=%d\n",
+                op->name,
+                Q->ne[0], Q->ne[1], Q->ne[2], Q->ne[3],
+                K->ne[0], K->ne[1], K->ne[2], K->ne[3],
+                V->ne[0], V->ne[1], V->ne[2], V->ne[3],
+                (void*)mask, max_bias, gqa_ratio);
+        } else {
+            fprintf(stderr, "[cuda] ACCEPT %s\n", op->name);
+        }
+        return result;
     }
 
     switch (op->op) {
