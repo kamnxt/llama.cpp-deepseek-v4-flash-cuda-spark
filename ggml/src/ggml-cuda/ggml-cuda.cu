@@ -4849,15 +4849,15 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             float max_bias = 0.0f;
             memcpy(&max_bias, (const float *) op->op_params + 1, sizeof(float));
             int gqa_ratio = Q->ne[2] / K->ne[2];
-            fprintf(stderr, "[cuda] REJECT %s: flash_attn unsupported Q[%ld,%ld,%ld,%ld] K[%ld,%ld,%ld,%ld] V[%ld,%ld,%ld,%ld] mask=%p max_bias=%f gqa=%d\n",
-                op->name,
-                Q->ne[0], Q->ne[1], Q->ne[2], Q->ne[3],
-                K->ne[0], K->ne[1], K->ne[2], K->ne[3],
-                V->ne[0], V->ne[1], V->ne[2], V->ne[3],
-                (void*)mask, max_bias, gqa_ratio);
-        } else {
-            fprintf(stderr, "[cuda] ACCEPT %s\n", op->name);
-        }
+                fprintf(stderr, "[cuda] REJECT %s: flash_attn unsupported Q[%ld,%ld,%ld,%ld] K[%ld,%ld,%ld,%ld] V[%ld,%ld,%ld,%ld] mask=%p max_bias=%f gqa=%d\n",
+                        op->name,
+                        Q->ne[0], Q->ne[1], Q->ne[2], Q->ne[3],
+                        K->ne[0], K->ne[1], K->ne[2], K->ne[3],
+                        V->ne[0], V->ne[1], V->ne[2], V->ne[3],
+                        (void*)mask, max_bias, gqa_ratio);
+            } else {
+                // accepted - no log needed
+            }
         return result;
     }
 

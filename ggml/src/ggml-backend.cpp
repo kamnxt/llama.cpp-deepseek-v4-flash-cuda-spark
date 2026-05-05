@@ -1077,11 +1077,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             } else if (cur_backend_id != -1) {
                 ggml_backend_sched_set_if_supported(sched, node, cur_backend_id, node_backend_id);
             }
-            // Debug: log FLASH_ATTN_EXT after expand-gpu-down
-            if (node->op == GGML_OP_FLASH_ATTN_EXT && *node_backend_id != -1) {
-                fprintf(stderr, "[sched] p2-down: node[%d] %s backend=%d\n",
-                    i, node->name, *node_backend_id);
-            }
+            // no debug logging for gpu-down
         }
     }
     // expand gpu up
@@ -1103,11 +1099,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             } else if (cur_backend_id != -1) {
                 ggml_backend_sched_set_if_supported(sched, node, cur_backend_id, node_backend_id);
             }
-            // Debug: log FLASH_ATTN_EXT after expand-gpu-up
-            if (node->op == GGML_OP_FLASH_ATTN_EXT && *node_backend_id != -1) {
-                fprintf(stderr, "[sched] p2-up:   node[%d] %s backend=%d\n",
-                    i, node->name, *node_backend_id);
-            }
+            // no debug logging for gpu-up
         }
     }
     // expand rest down
@@ -1152,15 +1144,6 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             }
         }
     }
-    // Debug: log FLASH_ATTN_EXT state before pass 3
-    for (int i = 0; i < graph->n_nodes; i++) {
-        struct ggml_tensor * node = graph->nodes[i];
-        if (node->op == GGML_OP_FLASH_ATTN_EXT) {
-            fprintf(stderr, "[sched] before-p3: node[%d] %s backend=%d\n",
-                i, node->name, tensor_backend_id(node));
-        }
-    }
-
     // pass 3: upgrade nodes to higher prio backends with compatible buffer types
     // if the tensor is already in the same buffer type (*) as another higher priority backend, we should move it there
     // however, we also need to verify that the sources are in compatible buffer types
@@ -1180,10 +1163,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             int n_supported_best = -1;
             for (int b = 0; b < sched->n_backends; b++) {
                 bool sup = ggml_backend_supports_op(sched->backends[b], node);
-                if (node->op == GGML_OP_FLASH_ATTN_EXT) {
-                    fprintf(stderr, "[sched] p3-node[%d] %s backend%d supports=%d\n",
-                        i, node->name, b, sup);
-                }
+                // no debug logging for p3-node
                 if (sup) {
                     int n_supported = 0;
                     for (int j = 0; j < GGML_MAX_SRC; j++) {
@@ -1239,12 +1219,22 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         }
     }
 
-    // Debug: log FLASH_ATTN_EXT state after pass 3
+    // Debug: log nodes NOT offloaded to GPU after pass 3
+    // backend=0 is GPU, backend=1+ is CPU or other, -1 is unassigned
+    // Skip view ops, REPEAT, TRANSPOSE (expected to be on CPU or unassigned)
+    static const int skip_ops[] = {GGML_OP_REPEAT, GGML_OP_GET_ROWS, GGML_OP_VIEW, GGML_OP_RESHAPE, GGML_OP_TRANSPOSE};
     for (int i = 0; i < graph->n_nodes; i++) {
         struct ggml_tensor * node = graph->nodes[i];
-        if (node->op == GGML_OP_FLASH_ATTN_EXT) {
-            fprintf(stderr, "[sched] after-p3:  node[%d] %s backend=%d\n",
-                i, node->name, tensor_backend_id(node));
+        int bid = tensor_backend_id(node);
+        if (bid != 0 && bid != -1) {
+            bool skip = false;
+            for (int j = 0; j < (int)(sizeof(skip_ops)/sizeof(skip_ops[0])); j++) {
+                if (node->op == skip_ops[j]) { skip = true; break; }
+            }
+            if (!skip) {
+                fprintf(stderr, "[sched] not-offloaded: node[%d] %s (%s) (backend=%d)\n",
+                    i, node->name, ggml_op_name(node->op), bid);
+            }
         }
     }
 
@@ -1292,12 +1282,21 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         GGML_ASSERT(*cur_backend_id != -1);
     }
 
-    // Debug: log FLASH_ATTN_EXT state after pass 4
+    // Debug: log nodes NOT offloaded to GPU after pass 4
+    // backend=0 is GPU, backend=1+ is CPU or other, -1 is unassigned
+    // Skip view ops, REPEAT, TRANSPOSE (expected to be on CPU or unassigned)
     for (int i = 0; i < graph->n_nodes; i++) {
         struct ggml_tensor * node = graph->nodes[i];
-        if (node->op == GGML_OP_FLASH_ATTN_EXT) {
-            fprintf(stderr, "[sched] after-p4:  node[%d] %s backend=%d\n",
-                i, node->name, tensor_backend_id(node));
+        int bid = tensor_backend_id(node);
+        if (bid != 0 && bid != -1) {
+            bool skip = false;
+            for (int j = 0; j < (int)(sizeof(skip_ops)/sizeof(skip_ops[0])); j++) {
+                if (node->op == skip_ops[j]) { skip = true; break; }
+            }
+            if (!skip) {
+                fprintf(stderr, "[sched] not-offloaded: node[%d] %s (%s) (backend=%d)\n",
+                    i, node->name, ggml_op_name(node->op), bid);
+            }
         }
     }
 
@@ -1615,12 +1614,17 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
             n_cpu, n_gpu, (n_cpu * 100.0f) / (n_cpu + n_gpu),
             gpu_splits, gpu_inputs, cpu_splits, cpu_inputs);
         if (n_cpu > 0) {
-            int printed = 0;
-            for (int i = 0; i < sched->graph.n_nodes && printed < 10; i++) {
+            static const int skip_ops[] = {GGML_OP_REPEAT, GGML_OP_GET_ROWS, GGML_OP_VIEW, GGML_OP_RESHAPE, GGML_OP_TRANSPOSE};
+            for (int i = 0; i < sched->graph.n_nodes; i++) {
                 struct ggml_tensor * node = sched->graph.nodes[i];
-                if (tensor_backend_id(node) == cpu_backend_id && node->op == GGML_OP_FLASH_ATTN_EXT) {
-                    GGML_LOG_INFO("  cpu_node[%d]: %s (%s) cause=%s\n", i, node->name, ggml_op_name(node->op), GET_CAUSE(node));
-                    printed++;
+                if (tensor_backend_id(node) == cpu_backend_id) {
+                    bool skip = false;
+                    for (int j = 0; j < (int)(sizeof(skip_ops)/sizeof(skip_ops[0])); j++) {
+                        if (node->op == skip_ops[j]) { skip = true; break; }
+                    }
+                    if (!skip) {
+                        GGML_LOG_INFO("  cpu_node[%d]: %s (%s) cause=%s\n", i, node->name, ggml_op_name(node->op), GET_CAUSE(node));
+                    }
                 }
             }
         }
