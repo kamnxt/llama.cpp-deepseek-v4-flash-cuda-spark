@@ -575,20 +575,25 @@ void llama_context::sched_reserve() {
         n_nodes_pp  = ggml_graph_n_nodes(gf);
     }
 
-    // DeepSeek V4 resumed-prompt chunks use the compressed-attention decode
-    // graph, which is larger than the position-zero prefill graph.
-    if (model.arch == LLM_ARCH_DEEPSEEK4 && n_tokens > 1) {
-        const llama_pos reserve_pos0 = std::min<llama_pos>(
-                cparams.n_ctx > n_tokens ? cparams.n_ctx - n_tokens : n_tokens,
-                std::max<uint32_t>(cparams.n_batch, 8u*n_tokens));
-        auto * gf = graph_reserve(n_tokens, n_seqs, n_tokens, mctx.get(),
-                model.hparams.no_alloc, nullptr, reserve_pos0);
-        if (!gf) {
-            throw std::runtime_error("failed to allocate DeepSeek V4 resumed pp buffers");
-        }
+    // DeepSeek V4: the compressed-attention decode graph at non-zero positions
+    // is larger than the position-zero prefill graph because compressed KV cache
+    // rows become visible. Reserve at a far-along position to cover both prefill
+    // (n_tokens > 1) and autoregressive decode (n_tokens == 1).
+    if (model.arch == LLM_ARCH_DEEPSEEK4) {
+        // use the furthest position that still leaves room for n_tokens
+        const llama_pos reserve_pos0 = cparams.n_ctx > n_tokens
+            ? cparams.n_ctx - n_tokens
+            : 0;
+        if (reserve_pos0 > 0) {
+            auto * gf = graph_reserve(n_tokens, n_seqs, n_tokens, mctx.get(),
+                    model.hparams.no_alloc, nullptr, reserve_pos0);
+            if (!gf) {
+                throw std::runtime_error("failed to allocate DeepSeek V4 non-zero pos buffers");
+            }
 
-        n_splits_pp = std::max(n_splits_pp, ggml_backend_sched_get_n_splits(sched.get()));
-        n_nodes_pp  = std::max(n_nodes_pp,  ggml_graph_n_nodes(gf));
+            n_splits_pp = std::max(n_splits_pp, ggml_backend_sched_get_n_splits(sched.get()));
+            n_nodes_pp  = std::max(n_nodes_pp,  ggml_graph_n_nodes(gf));
+        }
     }
 
     // reserve with tg (token generation) graph to get the number of splits and nodes
