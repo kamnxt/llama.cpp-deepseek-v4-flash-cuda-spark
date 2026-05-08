@@ -1819,6 +1819,12 @@ extern DECL_FATTN_MMA_F16_CASE(512, 512,  1,  8);
 extern DECL_FATTN_MMA_F16_CASE(512, 512,  2,  8);
 extern DECL_FATTN_MMA_F16_CASE(512, 512,  4,  8);
 extern DECL_FATTN_MMA_F16_CASE(512, 512,  8,  8);
+// ncols2=1 instantiations for DKQ=512 - fallback path when use_gqa_opt is false
+// (e.g., during initial prompt processing where K->ne[1] % FATTN_KQ_STRIDE != 0)
+extern DECL_FATTN_MMA_F16_CASE(512, 512,  8,  1);
+extern DECL_FATTN_MMA_F16_CASE(512, 512, 16,  1);
+extern DECL_FATTN_MMA_F16_CASE(512, 512, 32,  1);
+extern DECL_FATTN_MMA_F16_CASE(512, 512, 64,  1);
 
 // The number of viable configurations for Deepseek is very limited:
 extern DECL_FATTN_MMA_F16_CASE(576, 512, 1, 16);
