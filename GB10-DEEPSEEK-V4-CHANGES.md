@@ -173,9 +173,11 @@ cmake -S . -B build-cuda \
 cd build-cuda && make -j$(nproc)
 ```
 
-**Current generation speed**: ~15.1 t/s (DeepSeek V4 Flash)
-**Current prompt speed**: ~30 t/s
+**Current generation speed**: ~14.3 t/s (DeepSeek V4 Flash)
+**Current prompt speed**: ~26.4 t/s
 **Gemma-4-26B-A4B-it benchmark**: 49.9 t/s (CUDA backend works correctly)
+
+**IMPORTANT**: The SQRTSOFTPLUS gating function prevents MoE fusion on GPU, causing 43 CPU splits per token. This is the primary performance bottleneck. The MoE routing operations (ARGSORT, GET_ROWS) run on GPU, but the gating computation (SOFTPLUS → SQRT → ARGSORT) creates separate CPU splits that force GPU→CPU data transfers. Future work: implement SQRTSOFTPLUS fusion in ggml_cuda_topk_moe_fusion to move MoE gating to GPU.
 
 ---
 
@@ -217,11 +219,12 @@ For DeepSeek V4 (DKQ=576, DV=512, GQA ratio=64):
 - **ncols2=1 instantiations are NOT used for DeepSeek V4** (only for other models with DKQ=512)
 
 ### Optimization Opportunities
-1. **Graph splits (87)**: Heavy GPU↔CPU data copying. Each layer is a separate split. 44 GPU splits, 43 CPU splits.
-2. **MoE routing on CPU**: The MoE routing selects 2 out of 256 experts for each token. This might be happening on CPU, causing CPU↔GPU data transfers.
-3. **No WMMA path for GB10**: WMMA kernel explicitly excludes head dim 512/576. WMMA is also not enabled for Blackwell.
-4. **Stride alignment relaxation**: Consider changing `K->ne[1] % FATTN_KQ_STRIDE == 0` to `K->ne[1] % 1 == 0` (always true) to enable GQA optimization more often.
-5. **Alternative model**: `tecprovn/deepseek-v4-flash-gguf` Q3_K_M variant (94GB, Q3_M quantization) might avoid the stride issue with different memory layout.
+1. **SQRTSOFTPLUS fusion (PRIMARY)**: The SQRTSOFTPLUS gating function (SOFTPLUS → SQRT → ARGSORT → RESHAPE → VIEW → GET_ROWS) is NOT supported by ggml_cuda_topk_moe_fusion. This causes 43 CPU splits per token, forcing GPU→CPU data transfers. Implementing SQRTSOFTPLUS fusion in the CUDA backend could significantly improve generation speed by keeping MoE routing on GPU.
+2. **Graph splits (87)**: Heavy GPU↔CPU data copying. Each layer is a separate split. 44 GPU splits, 43 CPU splits. The CPU splits are primarily from SQRTSOFTPLUS gating.
+3. **MoE routing**: The MoE routing selects 6 out of 256 experts for each token (not 2). MUL_MAT_ID runs on GPU. ARGSORT and GET_ROWS run on GPU. But SQRTSOFTPLUS gating creates separate CPU splits.
+4. **No WMMA path for GB10**: WMMA kernel explicitly excludes head dim 512/576. WMMA is also not enabled for Blackwell.
+5. **Stride alignment relaxation**: Consider changing `K->ne[1] % FATTN_KQ_STRIDE == 0` to `K->ne[1] % 1 == 0` (always true) to enable GQA optimization more often.
+6. **Alternative model**: `tecprovn/deepseek-v4-flash-gguf` Q3_K_M variant (94GB, Q3_M quantization) might avoid the stride issue with different memory layout.
 
 ---
 
