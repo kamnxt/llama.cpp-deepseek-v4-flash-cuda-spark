@@ -106,7 +106,9 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
 
         ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 1>(ctx, dst);
     } else {
-        GGML_ABORT("fatal error");
+        // For DKQ > 256 without GQA optimization, fall back to ncols2=1
+        // This processes one group at a time - slower but works for any sequence length
+        ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 1>(ctx, dst);
     }
 }
 
@@ -356,15 +358,9 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             if (V->ne[0] != K->ne[0]) {
                 return BEST_FATTN_KERNEL_NONE;
             }
-            if (!gqa_opt_applies) {
-                return BEST_FATTN_KERNEL_NONE;
-            }
             break;
         case 576:
             if (V->ne[0] != 512) {
-                return BEST_FATTN_KERNEL_NONE;
-            }
-            if (!gqa_opt_applies) {
                 return BEST_FATTN_KERNEL_NONE;
             }
             break;
