@@ -3256,6 +3256,7 @@ static bool ggml_cuda_should_fuse_rope_set_rows(const ggml_tensor * rope,
 static bool ggml_cuda_topk_moe_fusion(const struct ggml_cgraph * cgraph, int node_idx, ggml_cuda_topk_moe_args & args) {
     args.sigmoid         = false;
     args.softmax         = false;
+    args.sqrtsoftplus    = false;
     args.delayed_softmax = false;
     args.prob_bias       = false;
     args.norm            = false;
@@ -3268,10 +3269,13 @@ static bool ggml_cuda_topk_moe_fusion(const struct ggml_cgraph * cgraph, int nod
     }
 
     if (nodes[node_idx]->op == GGML_OP_UNARY) {
-        if (ggml_get_unary_op(nodes[node_idx]) != GGML_UNARY_OP_SIGMOID) {
+        if (ggml_get_unary_op(nodes[node_idx]) == GGML_UNARY_OP_SIGMOID) {
+            args.sigmoid = true;
+        } else if (ggml_get_unary_op(nodes[node_idx]) == GGML_UNARY_OP_SOFTPLUS) {
+            args.sqrtsoftplus = true;
+        } else {
             return false;
         }
-        args.sigmoid = true;
     }
 
     if (nodes[node_idx]->op == GGML_OP_ARGSORT) {
@@ -3280,7 +3284,65 @@ static bool ggml_cuda_topk_moe_fusion(const struct ggml_cgraph * cgraph, int nod
 
     node_idx++;
 
-    if (args.sigmoid || args.softmax) {
+    if (args.sqrtsoftplus) {
+        // SQRTSOFTPLUS: UNARY(SOFTPLUS) -> SQRT -> ARGSORT -> RESHAPE -> VIEW -> GET_ROWS
+        // With bias: UNARY(SOFTPLUS) -> SQRT -> ADD -> ARGSORT -> RESHAPE -> VIEW -> GET_ROWS
+        if (node_idx >= n_nodes || nodes[node_idx]->op != GGML_OP_SQRT ||
+                nodes[node_idx]->src[0] != nodes[node_idx - 1]) {
+            return false;
+        }
+        ggml_tensor * probs_sqrt = nodes[node_idx];
+        node_idx++;
+
+        if (node_idx >= n_nodes) {
+            return false;
+        }
+
+        // SQRT -> ARGSORT (no bias) or SQRT -> ADD (bias) -> ARGSORT
+        if (nodes[node_idx]->op == GGML_OP_ADD && nodes[node_idx]->src[0] == nodes[node_idx - 1]) {
+            args.prob_bias = true;
+            node_idx++;
+        }
+        // ARGSORT
+        if (node_idx >= n_nodes || nodes[node_idx]->op != GGML_OP_ARGSORT) {
+            return false;
+        }
+
+        // ARGSORT src[0] is SQRT (no bias) or ADD output (bias)
+        if (args.prob_bias && nodes[node_idx]->src[0] != nodes[node_idx - 1]) {
+            return false;
+        } else if (!args.prob_bias && nodes[node_idx]->src[0] != probs_sqrt) {
+            return false;
+        }
+
+        node_idx++;
+
+        // ARGSORT -> RESHAPE (probs_3d for GET_ROWS)
+        if (node_idx >= n_nodes || nodes[node_idx]->op != GGML_OP_RESHAPE ||
+                nodes[node_idx]->src[0] != probs_sqrt) {
+            return false;
+        }
+        ggml_tensor * probs_reshaped = nodes[node_idx];
+        node_idx++;
+
+        // RESHAPE -> VIEW
+        if (node_idx >= n_nodes || nodes[node_idx]->op != GGML_OP_VIEW ||
+                nodes[node_idx]->src[0] != nodes[node_idx - 2]) {
+            return false;
+        }
+        node_idx++;
+
+        // VIEW -> GET_ROWS
+        if (node_idx >= n_nodes || nodes[node_idx]->op != GGML_OP_GET_ROWS) {
+            return false;
+        }
+
+        // GET_ROWS uses probs_reshaped and VIEW (selected_experts)
+        if (nodes[node_idx]->src[0] != probs_reshaped || nodes[node_idx]->src[1] != nodes[node_idx - 1]) {
+            return false;
+        }
+        node_idx++;
+    } else if (args.sigmoid || args.softmax) {
         // SOFTMAX -> RESHAPE
         if (node_idx >= n_nodes || nodes[node_idx]->op != GGML_OP_RESHAPE ||
                 nodes[node_idx]->src[0] != nodes[node_idx - 1]) {
@@ -3822,10 +3884,23 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                             const ggml_tensor * scale   = nullptr;
 
                             if (!args.delayed_softmax) {
-                                ggml_op gating_op = args.sigmoid ? GGML_OP_UNARY : GGML_OP_SOFT_MAX;
+                                ggml_op gating_op = args.sqrtsoftplus ? GGML_OP_UNARY : (args.sigmoid ? GGML_OP_UNARY : GGML_OP_SOFT_MAX);
                                 int     out_nodes[2];  // nodes which can't be elided
 
-                                if (args.prob_bias) {
+                                if (args.sqrtsoftplus && args.prob_bias) {
+                                    // SQRTSOFTPLUS with bias: UNARY(SOFTPLUS) -> SQRT -> ADD -> ARGSORT -> RESHAPE -> VIEW -> GET_ROWS
+                                    bias = cgraph->nodes[i + 3]->src[1];
+                                    ops.insert(ops.end(), { gating_op, GGML_OP_SQRT, GGML_OP_ADD, GGML_OP_ARGSORT,
+                                                            GGML_OP_RESHAPE, GGML_OP_VIEW, GGML_OP_GET_ROWS });
+                                    out_nodes[0] = i + 7;
+                                    ids          = cgraph->nodes[i + 7];
+                                } else if (args.sqrtsoftplus) {
+                                    // SQRTSOFTPLUS without bias: UNARY(SOFTPLUS) -> SQRT -> ARGSORT -> RESHAPE -> VIEW -> GET_ROWS
+                                    ops.insert(ops.end(), { gating_op, GGML_OP_SQRT, GGML_OP_ARGSORT, GGML_OP_RESHAPE,
+                                                            GGML_OP_VIEW, GGML_OP_GET_ROWS });
+                                    out_nodes[0] = i + 6;
+                                    ids          = cgraph->nodes[i + 6];
+                                } else if (args.prob_bias) {
                                     bias = cgraph->nodes[i + 2]->src[1];
                                     ops.insert(ops.end(), { gating_op, GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_ARGSORT,
                                                             GGML_OP_VIEW, GGML_OP_GET_ROWS });

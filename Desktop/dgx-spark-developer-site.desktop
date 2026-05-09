@@ -1,0 +1,7 @@
+[Desktop Entry]
+Version=1.0
+Name=DGX Spark Resources
+Icon=nvidia-doc-logo_64x64
+Type=Application
+Exec=xdg-open https://build.nvidia.com/spark
+Terminal=false

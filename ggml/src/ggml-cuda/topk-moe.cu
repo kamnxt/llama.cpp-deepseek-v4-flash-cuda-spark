@@ -406,7 +406,7 @@ bool ggml_cuda_should_use_topk_moe(const ggml_tensor * gating_op,
     } else if (gating_op->op == GGML_OP_UNARY) {
         ggml_unary_op op = ggml_get_unary_op(gating_op);
 
-        if (op != GGML_UNARY_OP_SIGMOID) {
+        if (op != GGML_UNARY_OP_SIGMOID && op != GGML_UNARY_OP_SOFTPLUS) {
             return false;
         }
     }
