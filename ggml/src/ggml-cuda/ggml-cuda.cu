@@ -3254,6 +3254,7 @@ static bool ggml_cuda_should_fuse_rope_set_rows(const ggml_tensor * rope,
 }
 
 static bool ggml_cuda_topk_moe_fusion(const struct ggml_cgraph * cgraph, int node_idx, ggml_cuda_topk_moe_args & args) {
+    GGML_LOG_INFO("ggml_cuda_topk_moe_fusion: node_idx=%d, op=%s\n", node_idx, ggml_op_name(cgraph->nodes[node_idx]->op));
     args.sigmoid         = false;
     args.softmax         = false;
     args.sqrtsoftplus    = false;
@@ -3285,8 +3286,9 @@ static bool ggml_cuda_topk_moe_fusion(const struct ggml_cgraph * cgraph, int nod
     node_idx++;
 
     if (args.sqrtsoftplus) {
-        // SQRTSOFTPLUS: UNARY(SOFTPLUS) -> SQRT -> ARGSORT -> RESHAPE -> VIEW -> GET_ROWS
-        // With bias: UNARY(SOFTPLUS) -> SQRT -> ADD -> ARGSORT -> RESHAPE -> VIEW -> GET_ROWS
+        // SQRTSOFTPLUS: UNARY(SOFTPLUS) -> SQRT -> RESHAPE -> ARGSORT -> VIEW -> GET_ROWS
+        // DeepSeek V4: UNARY(SOFTPLUS) -> SQRT -> ADD(bias) -> ARGSORT -> RESHAPE -> GET_ROWS
+        GGML_LOG_INFO("SQRTSOFTPLUS: node_idx=%d, n_nodes=%d\n", node_idx, n_nodes);
         if (node_idx >= n_nodes || nodes[node_idx]->op != GGML_OP_SQRT ||
                 nodes[node_idx]->src[0] != nodes[node_idx - 1]) {
             return false;
@@ -3294,54 +3296,92 @@ static bool ggml_cuda_topk_moe_fusion(const struct ggml_cgraph * cgraph, int nod
         ggml_tensor * probs_sqrt = nodes[node_idx];
         node_idx++;
 
+        // Check for bias (ADD between SQRT and next op)
+        if (node_idx < n_nodes && nodes[node_idx]->op == GGML_OP_ADD &&
+                nodes[node_idx]->src[0] == probs_sqrt) {
+            GGML_LOG_INFO("SQRTSOFTPLUS: bias detected at node_idx=%d\n", node_idx);
+            args.prob_bias = true;
+            node_idx++;
+        }
+
+        // Two patterns:
+        // Standard: RESHAPE -> ARGSORT -> VIEW -> GET_ROWS
+        // DeepSeek V4 (reversed): ARGSORT -> RESHAPE -> GET_ROWS
         if (node_idx >= n_nodes) {
             return false;
         }
 
-        // SQRT -> ARGSORT (no bias) or SQRT -> ADD (bias) -> ARGSORT
-        if (nodes[node_idx]->op == GGML_OP_ADD && nodes[node_idx]->src[0] == nodes[node_idx - 1]) {
-            args.prob_bias = true;
+        if (nodes[node_idx]->op == GGML_OP_RESHAPE) {
+            // Standard pattern: RESHAPE -> ARGSORT -> VIEW -> GET_ROWS
+            ggml_tensor * probs_reshaped = nodes[node_idx];
             node_idx++;
-        }
-        // ARGSORT
-        if (node_idx >= n_nodes || nodes[node_idx]->op != GGML_OP_ARGSORT) {
-            return false;
-        }
 
-        // ARGSORT src[0] is SQRT (no bias) or ADD output (bias)
-        if (args.prob_bias && nodes[node_idx]->src[0] != nodes[node_idx - 1]) {
-            return false;
-        } else if (!args.prob_bias && nodes[node_idx]->src[0] != probs_sqrt) {
+            if (node_idx >= n_nodes || nodes[node_idx]->op != GGML_OP_ARGSORT) {
+                return false;
+            }
+
+            if (nodes[node_idx]->src[0] != probs_sqrt) {
+                GGML_LOG_INFO("SQRTSOFTPLUS FAIL: ARGSORT src[0]=%p, expected=%p\n", (void*)nodes[node_idx]->src[0], (void*)probs_sqrt);
+                return false;
+            }
+            node_idx++;
+
+            // ARGSORT -> VIEW
+            if (node_idx >= n_nodes || nodes[node_idx]->op != GGML_OP_VIEW ||
+                    nodes[node_idx]->src[0] != nodes[node_idx - 1]) {
+                return false;
+            }
+            node_idx++;
+
+            // VIEW -> GET_ROWS
+            if (node_idx >= n_nodes || nodes[node_idx]->op != GGML_OP_GET_ROWS) {
+                return false;
+            }
+
+            // GET_ROWS uses probs_reshaped and VIEW (selected_experts)
+            if (nodes[node_idx]->src[0] != probs_reshaped || nodes[node_idx]->src[1] != nodes[node_idx - 1]) {
+                return false;
+            }
+            node_idx++;
+        } else if (nodes[node_idx]->op == GGML_OP_ARGSORT) {
+            // DeepSeek V4 pattern: ARGSORT -> RESHAPE -> GET_ROWS
+            args.reversed_order = true;
+            // ARGSORT operates on probs+exp_probs_b (bias already applied above)
+            if (args.prob_bias && nodes[node_idx]->src[0] != nodes[node_idx - 1]) {
+                GGML_LOG_INFO("SQRTSOFTPLUS FAIL (DSv4): ARGSORT src[0]=%p, expected bias result=%p\n",
+                    (void*)nodes[node_idx]->src[0], (void*)nodes[node_idx - 1]);
+                return false;
+            }
+            if (!args.prob_bias && nodes[node_idx]->src[0] != probs_sqrt) {
+                GGML_LOG_INFO("SQRTSOFTPLUS FAIL (DSv4): ARGSORT src[0]=%p, expected probs_sqrt=%p\n",
+                    (void*)nodes[node_idx]->src[0], (void*)probs_sqrt);
+                return false;
+            }
+            node_idx++;
+
+            // ARGSORT -> RESHAPE
+            if (node_idx >= n_nodes || nodes[node_idx]->op != GGML_OP_RESHAPE ||
+                    nodes[node_idx]->src[0] != probs_sqrt) {
+                return false;
+            }
+            ggml_tensor * probs_reshaped = nodes[node_idx];
+            node_idx++;
+
+            // RESHAPE -> GET_ROWS
+            if (node_idx >= n_nodes || nodes[node_idx]->op != GGML_OP_GET_ROWS) {
+                return false;
+            }
+
+            // GET_ROWS uses probs_reshaped and ARGSORT result (selected_experts)
+            if (nodes[node_idx]->src[0] != probs_reshaped || nodes[node_idx]->src[1] != nodes[node_idx - 2]) {
+                return false;
+            }
+            node_idx++;
+        } else {
+            GGML_LOG_INFO("SQRTSOFTPLUS FAIL: unexpected op %s at node_idx=%d\n", ggml_op_name(nodes[node_idx]->op), node_idx);
             return false;
         }
-
-        node_idx++;
-
-        // ARGSORT -> RESHAPE (probs_3d for GET_ROWS)
-        if (node_idx >= n_nodes || nodes[node_idx]->op != GGML_OP_RESHAPE ||
-                nodes[node_idx]->src[0] != probs_sqrt) {
-            return false;
-        }
-        ggml_tensor * probs_reshaped = nodes[node_idx];
-        node_idx++;
-
-        // RESHAPE -> VIEW
-        if (node_idx >= n_nodes || nodes[node_idx]->op != GGML_OP_VIEW ||
-                nodes[node_idx]->src[0] != nodes[node_idx - 2]) {
-            return false;
-        }
-        node_idx++;
-
-        // VIEW -> GET_ROWS
-        if (node_idx >= n_nodes || nodes[node_idx]->op != GGML_OP_GET_ROWS) {
-            return false;
-        }
-
-        // GET_ROWS uses probs_reshaped and VIEW (selected_experts)
-        if (nodes[node_idx]->src[0] != probs_reshaped || nodes[node_idx]->src[1] != nodes[node_idx - 1]) {
-            return false;
-        }
-        node_idx++;
+        GGML_LOG_INFO("SQRTSOFTPLUS fusion: SUCCESS\n");
     } else if (args.sigmoid || args.softmax) {
         // SOFTMAX -> RESHAPE
         if (node_idx >= n_nodes || nodes[node_idx]->op != GGML_OP_RESHAPE ||
@@ -3887,19 +3927,33 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                                 ggml_op gating_op = args.sqrtsoftplus ? GGML_OP_UNARY : (args.sigmoid ? GGML_OP_UNARY : GGML_OP_SOFT_MAX);
                                 int     out_nodes[2];  // nodes which can't be elided
 
-                                if (args.sqrtsoftplus && args.prob_bias) {
-                                    // SQRTSOFTPLUS with bias: UNARY(SOFTPLUS) -> SQRT -> ADD -> ARGSORT -> RESHAPE -> VIEW -> GET_ROWS
-                                    bias = cgraph->nodes[i + 3]->src[1];
-                                    ops.insert(ops.end(), { gating_op, GGML_OP_SQRT, GGML_OP_ADD, GGML_OP_ARGSORT,
-                                                            GGML_OP_RESHAPE, GGML_OP_VIEW, GGML_OP_GET_ROWS });
-                                    out_nodes[0] = i + 7;
-                                    ids          = cgraph->nodes[i + 7];
+                                if (args.sqrtsoftplus && args.reversed_order) {
+                                    // DeepSeek V4 SQRTSOFTPLUS: UNARY(SOFTPLUS) -> SQRT -> [ADD] -> ARGSORT -> RESHAPE -> GET_ROWS
+                                    if (args.prob_bias) {
+                                        bias = cgraph->nodes[i + 2]->src[1];
+                                        ops.insert(ops.end(), { gating_op, GGML_OP_SQRT, GGML_OP_ADD,
+                                                                GGML_OP_ARGSORT, GGML_OP_RESHAPE, GGML_OP_GET_ROWS });
+                                        out_nodes[0] = i + 3;
+                                        ids          = cgraph->nodes[i + 3];
+                                    } else {
+                                        ops.insert(ops.end(), { gating_op, GGML_OP_SQRT,
+                                                                GGML_OP_ARGSORT, GGML_OP_RESHAPE, GGML_OP_GET_ROWS });
+                                        out_nodes[0] = i + 2;
+                                        ids          = cgraph->nodes[i + 2];
+                                    }
+                                } else if (args.sqrtsoftplus && args.prob_bias) {
+                                    // SQRTSOFTPLUS with bias: UNARY(SOFTPLUS) -> SQRT -> ADD -> RESHAPE -> ARGSORT -> VIEW -> GET_ROWS
+                                    bias = cgraph->nodes[i + 2]->src[1];
+                                    ops.insert(ops.end(), { gating_op, GGML_OP_SQRT, GGML_OP_ADD, GGML_OP_RESHAPE,
+                                                            GGML_OP_ARGSORT, GGML_OP_VIEW, GGML_OP_GET_ROWS });
+                                    out_nodes[0] = i + 5; // VIEW (i+5) instead of ARGSORT (i+4) because VIEW has external uses (MUL_MAT_ID)
+                                    ids          = cgraph->nodes[i + 5];
                                 } else if (args.sqrtsoftplus) {
-                                    // SQRTSOFTPLUS without bias: UNARY(SOFTPLUS) -> SQRT -> ARGSORT -> RESHAPE -> VIEW -> GET_ROWS
-                                    ops.insert(ops.end(), { gating_op, GGML_OP_SQRT, GGML_OP_ARGSORT, GGML_OP_RESHAPE,
+                                    // SQRTSOFTPLUS without bias: UNARY(SOFTPLUS) -> SQRT -> RESHAPE -> ARGSORT -> VIEW -> GET_ROWS
+                                    ops.insert(ops.end(), { gating_op, GGML_OP_SQRT, GGML_OP_RESHAPE, GGML_OP_ARGSORT,
                                                             GGML_OP_VIEW, GGML_OP_GET_ROWS });
-                                    out_nodes[0] = i + 6;
-                                    ids          = cgraph->nodes[i + 6];
+                                    out_nodes[0] = i + 4; // VIEW (i+4) instead of ARGSORT (i+3) because VIEW has external uses
+                                    ids          = cgraph->nodes[i + 4];
                                 } else if (args.prob_bias) {
                                     bias = cgraph->nodes[i + 2]->src[1];
                                     ops.insert(ops.end(), { gating_op, GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_ARGSORT,
@@ -3927,11 +3981,17 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                                 out_nodes[1] = i + ops.size() - 1;
 
                                 if (ggml_can_fuse_subgraph(cgraph, i, ops.size(), ops.data(), out_nodes, 2) &&
-                                    ggml_cuda_should_use_topk_moe(node, logits, weights, ids) &&
-                                    ggml_cuda_check_fusion_memory_ranges(cgraph, i, ops.size(), out_nodes, 2, /*is_topk_moe=*/ true)) {
+                                     ggml_cuda_should_use_topk_moe(node, logits, weights, ids) &&
+                                     ggml_cuda_check_fusion_memory_ranges(cgraph, i, ops.size(), out_nodes, 2, /*is_topk_moe=*/ true)) {
+                                    GGML_LOG_INFO("SQRTSOFTPLUS fusion applied (ops.size()=%zu)\n", ops.size());
                                     ggml_cuda_op_topk_moe(*cuda_ctx, logits, weights, ids, clamp, scale, bias, args);
                                     i += ops.size() - 1;
                                     continue;
+                                } else {
+                                    GGML_LOG_INFO("SQRTSOFTPLUS fusion rejected: can_fuse=%d, should_use=%d, check_mem=%d\n",
+                                                  ggml_can_fuse_subgraph(cgraph, i, ops.size(), ops.data(), out_nodes, 2),
+                                                  ggml_cuda_should_use_topk_moe(node, logits, weights, ids),
+                                                  ggml_cuda_check_fusion_memory_ranges(cgraph, i, ops.size(), out_nodes, 2, /*is_topk_moe=*/ true));
                                 }
                             } else if (!args.norm && !args.prob_bias) {
                                 //special case gpt-oss, no norm, no bias.
