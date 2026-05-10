@@ -473,10 +473,22 @@ int main(int argc, char ** argv) {
             console::log("\n> ");
             std::string line;
             bool another_line = true;
+            bool first_read = true;
             do {
                 another_line = console::readline(line, params.multiline_input);
+                if (first_read && !another_line && line.empty()) {
+                    // EOF on stdin, exit
+                    console::log("\n");
+                    break;
+                }
+                first_read = false;
                 buffer += line;
             } while (another_line);
+
+            // if we broke due to EOF, exit the main loop
+            if (buffer.empty() && !another_line && first_read) {
+                break;
+            }
         } else {
             // process input prompt from args
             for (auto & fname : params.image) {
