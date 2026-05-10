@@ -16,6 +16,7 @@
 | `328cddf71` | fix: reserve compute buffers for DeepSeek V4 non-zero positions during autoregressive decode |
 | `dcf74b4dd` | fix: offload input (embedding) layer to GPU to reduce splits |
 | `74d73e3a2` | logging: show only not-offloaded ops (skip REPEAT/VIEW/TRANSPOSE) |
+| `(next)` | scripts: add Q8_0→MXFP4 conversion tool and documentation |
 
 ---
 
@@ -187,6 +188,49 @@ cd build-cuda && make -j$(nproc)
 
 ---
 
+## MXFP4 Conversion
+
+### Script
+`scripts/convert_q8_to_mxfp4.py` — converts all Q8_0 tensors (attention projections, shared experts, output layer) to MXFP4 format in-place.
+
+**Usage:**
+```bash
+python3 scripts/convert_q8_to_mxfp4.py input.gguf output_mxfp4.gguf
+```
+
+**Results on DeepSeek V4 Flash (GB10):**
+| Metric | Before (Q8_0 attn) | After (MXFP4 attn) | Change |
+|--------|-------------------|-------------------|--------|
+| File size | 81 GB | 78 GB | -3.7% |
+| VRAM | 82,697 MiB | 79,551 MiB | -3.8% |
+| Generation | 15.4 t/s | 20.6 t/s | **+33.8%** |
+| Prompt (short) | 30.8 t/s | 31.5 t/s | ~same |
+
+**Kernel breakdown after conversion (nsys, 512 tokens):**
+| Kernel | Time | What |
+|--------|------|------|
+| MXFP4 mat-vec (type=39) | 38.0% | Attention projections, shared FFN, output (was Q8_0 at 38.9%) |
+| IQ2_XXS mat-vec (type=16) | 16.2% | MoE gate/up experts |
+| FP16 mat-vec | 9.3% | Flash attention score×V |
+| Q2_K mat-vec (type=10) | 10.4% | MoE down experts |
+| dsv4_hc_split_sinkhorn | 7.0% | Hyper-connection + sinkhorn |
+| dsv4_fp8_kv_quantize | 4.9% | KV cache quantization |
+
+Absolute MXFP4 mat-vec time dropped from 25.3→18.4 ms/token. GPU utilization ~82%.
+
+### Why It Works
+- MXFP4 halves memory traffic vs Q8_0 (0.5 B/weight vs 1.0 B/weight)
+- Mat-vec at batch=1 is memory-bandwidth bound, so less data → directly faster
+- For prompt processing (batch>1), Blackwell native FP4 tensor cores activate via the existing mmq path (`mma.sync.aligned.kind::mxf4.block_scale.m16n8k64`)
+
+### Conversion Process
+1. Reads original GGUF via `gguf.GGUFReader`
+2. For each Q8_0 tensor: dequantize to f32 → quantize to MXFP4
+3. Copies all other tensors as-is (IQ2_XXS, Q2_K, F16, F32)
+4. Writes new GGUF via `gguf.GGUFWriter` with `use_temp_file=True`
+
+---
+
 ## Model Testing
 
 ### Command Line Flags
@@ -202,9 +246,27 @@ cd build-cuda && make -j$(nproc)
 
 **`-ngl 99`**: Offload all layers to GPU.
 
-### Model Path
+### Model Paths
 ```
-/home/pi/.cache/huggingface/hub/models--antirez--deepseek-v4-gguf/snapshots/3af08b96a788790ef6f1d113e5257794622884b8/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2.gguf
+# Original (Q8_0 attention):
+~/.cache/huggingface/hub/models--antirez--deepseek-v4-gguf/snapshots/.../DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2.gguf
+
+# MXFP4 attention:
+/home/pi/DeepSeek-V4-Flash-MXFP4-Attn.gguf
+```
+
+### Benchmark Commands
+```bash
+# Generation benchmark (1024 tokens)
+echo "write a list reversing algorithm in haskell" | \
+  ./build-cuda/bin/llama-cli --no-mmap --direct-io -c 8192 -n 1024 \
+  --simple-io -f /dev/stdin -ngl 99 -m /path/to/model.gguf 2>&1 | tail -10
+
+# GPU profiling (512 tokens)
+echo "write a list reversing algorithm in haskell" | \
+  nsys profile -t cuda -o /tmp/nsys_profile --kill=none \
+  ./build-cuda/bin/llama-cli --no-mmap --direct-io -c 8192 -n 512 \
+  --simple-io -f /dev/stdin -ngl 99 -m /path/to/model.gguf 2>&1 | tail -5
 ```
 
 ---
@@ -212,11 +274,15 @@ cd build-cuda && make -j$(nproc)
 ## Known Issues / Potential Improvements
 
 ### Current Performance Profile
-- **Model size**: ~86.7 GB
-- **Prompt speed**: 30 t/s
-- **Generation speed**: 15.1 t/s
-- **Graph splits**: 87 splits (44 GPU, 43 CPU) with 91 GPU inputs
-- **CPU nodes**: 45 nodes (MoE routing, KV cache operations)
+- **Model size (MXFP4 attn)**: ~78 GB (was ~86.7 GB with Q8_0)
+- **Generation speed**: 20.6 t/s (+33.8% from 15.4 t/s)
+- **GPU utilization**: 82% (18% idle — launch gaps, sync points)
+- **CPU nodes**: 2 VIEW no-ops (all other ops on GPU)
+
+### Next Optimization Targets
+1. **Speculative decoding**: Process multiple tokens in parallel → fill the 18% GPU idle gap → convert mat-vec to mat-mat for Blackwell FP4 tensor cores
+2. **Self-speculative** (`--spec-type ngram-mod`): No draft model needed, ~1.3-1.5x expected speedup
+3. **Draft model speculation**: Need model with DeepSeek V4-compatible tokenizer
 
 ### FA Kernel Dispatch Path
 For DeepSeek V4 (DKQ=576, DV=512, GQA ratio=64):
