@@ -296,10 +296,9 @@ static ggml_cuda_device_info ggml_cuda_init() {
             turing_devices_without_mma.push_back({ id, device_name });
         }
 
-        // Temporary performance fix:
-        // Setting device scheduling strategy for iGPUs with cc121 to "spinning" to avoid delays in cuda synchronize calls.
-        // TODO: Check for future drivers the default scheduling strategy and
-        // remove this call again when cudaDeviceScheduleSpin is default.
+        // Spin mode is required for performance on cc12.1 iGPUs.
+        // cudaDeviceScheduleBlockingSync causes ~40% generation speed regression.
+        // TODO: Re-evaluate when CUDA default scheduling improves for iGPUs.
         if (prop.major == 12 && prop.minor == 1) {
             CUDA_CHECK(cudaSetDevice(id));
             CUDA_CHECK(cudaSetDeviceFlags(cudaDeviceScheduleSpin));
@@ -5216,7 +5215,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_REPEAT:
             {
                 ggml_type src0_type = op->src[0]->type;
-                return src0_type != GGML_TYPE_I32 && src0_type != GGML_TYPE_I16;
+                return src0_type != GGML_TYPE_I16;
             } break;
         case GGML_OP_REPEAT_BACK:
                 return op->type == GGML_TYPE_F32 && (op->src[0]->ne[2]*op->src[0]->ne[3]) <= (1 << 15);

@@ -1190,6 +1190,18 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 GGML_LOG_INFO("pass3: node[%d] %s NO backend supports it after unassigned loop\n",
                     i, node->name);
             }
+
+            // Prefer GPU for REPEAT ops to avoid cross-backend sync overhead.
+            // REPEAT on CPU forces GPU pipeline drain + data copy at every split boundary.
+            if (*node_backend_id == sched->n_backends - 1 && node->op == GGML_OP_REPEAT) {
+                for (int b = 0; b < sched->n_backends - 1; b++) {
+                    if (ggml_backend_supports_op(sched->backends[b], node)) {
+                        *node_backend_id = b;
+                        SET_CAUSE(node, "3.repeat_gpu");
+                        break;
+                    }
+                }
+            }
         } else {
             // assigned node: upgrade to higher prio backend if possible
             for (int b = 0; b < *node_backend_id; b++) {
